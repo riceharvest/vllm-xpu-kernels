@@ -943,7 +943,13 @@ void call_rms_norm_mxfp4_quant_kernel(
   const int hidden_size = input.size(-1);
   const int64_t num_tokens = input.numel() / hidden_size;
   const int num_groups = hidden_size / group_size;
-  const int block_size = std::min(hidden_size, 1024);
+  // One work-item handles one 16-byte vector (VEC elements): size the
+  // work-group by vectors, rounded up to the sub-group size (32) so MX
+  // groups stay sub-group aligned, cap at 1024.
+  constexpr int VEC = 16 / sizeof(sycl_t);
+  const int num_vec = hidden_size / VEC;
+  const int block_size =
+      std::min(std::max(((num_vec + 31) / 32) * 32, 32), 1024);
 
   const int64_t scale_stride_token =
       is_scale_transposed ? 1 : static_cast<int64_t>(num_groups);
