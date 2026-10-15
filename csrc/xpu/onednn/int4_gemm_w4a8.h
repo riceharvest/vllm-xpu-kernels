@@ -112,12 +112,22 @@ static inline void dnnl_matmul_w4a8_int4(
   at::Device curDevice = at::Device(at::kXPU, dev_id);
   auto engine = GpuEngineManager::Instance().get_engine(curDevice);
 
-  // Encode the number of elements of m1_sc and m2_sc into a single int64_t:
-  // upper 32 bits: m1_sc.numel(), lower 32 bits: m2_sc.numel()
-  int64_t sc_group_size = (static_cast<int64_t>(m1_sc.numel()) << 32) |
-                          static_cast<int64_t>(m2_sc.numel());
-  int64_t zp_group_size = (static_cast<int64_t>(m1_zp.numel()) << 32) |
-                          static_cast<int64_t>(m2_zp.numel());
+  // Cache key: one field per value, all int64 (the old packed int64 keys
+  // were truncated to int when passed on). Covers the src per-token vs
+  // per-tensor branch, weight zp mode, group size, and dtype / shape /
+  // strides of every scale and zero-point tensor whose memory descriptor is
+  // cached on the first call.
+  const bool src_per_token = m1_sc.numel() == m;
+  const bool wei_zp_symmetric = m2_zp.numel() == 1;
+  memory::dims attr_key;
+  append_key(attr_key, result.scalar_type());
+  append_key(attr_key, group_size);
+  append_key(attr_key, static_cast<int64_t>(src_per_token));
+  append_key(attr_key, static_cast<int64_t>(wei_zp_symmetric));
+  append_tensor_key(attr_key, m1_sc);
+  append_tensor_key(attr_key, m1_zp);
+  append_tensor_key(attr_key, m2_sc);
+  append_tensor_key(attr_key, m2_zp);
   auto& matmul_ext = matmul_primitive_create_and_cache(
       jd,
       trans_type_t::nt,
@@ -130,8 +140,7 @@ static inline void dnnl_matmul_w4a8_int4(
       ldc,
       dev_id,
       f_attr,
-      sc_group_size,
-      zp_group_size);
+      attr_key);
 
   int arg_off = 0;
   // set m2_sc and zero point for matmul args

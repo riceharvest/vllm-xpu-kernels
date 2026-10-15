@@ -130,18 +130,23 @@ static inline void dnnl_matmul_w8a16_fp8(
   at::Device curDevice = at::Device(at::kXPU, dev_id);
   auto engine = GpuEngineManager::Instance().get_engine(curDevice);
 
-  // Scale shape selects the mask and {group_k, group_n}, so it must be keyed:
-  // e.g. [1, 20] and [2, 10] have the same numel but different groups.
-  auto hash_dims = [](const torch::Tensor& tensor) {
-    int hash = tensor.dim();
-    for (const auto size : tensor.sizes()) {
-      hash = hash * 131 + static_cast<int>(size);
-    }
-    return hash;
-  };
-  int sc_group_size = (group_size << 8) ^ hash_dims(m2_sc);
+  // Cache key: everything f_attr and the cached scale memory depend on, one
+  // field per value. Scale shape selects mask and {group_k, group_n}, e.g.
+  // [1, 20] and [2, 10] share numel but differ in groups; the scale dtype is
+  // baked into set_scales() and the scale memory descriptor.
+  const int wei_sc_mask = is_block_quant       ? (1 << 0) + (1 << 1)
+                          : m2_sc.numel() == 1 ? 0
+                                               : (1 << 1);
+  memory::dims attr_key;
+  append_key(attr_key, result.scalar_type());
+  append_key(attr_key, group_size);
+  append_key(attr_key, static_cast<int64_t>(is_block_quant));
+  append_key(attr_key, wei_sc_mask);
+  append_key(attr_key, blk_group_k);
+  append_key(attr_key, blk_group_n);
+  append_tensor_key(attr_key, m2_sc);
   auto& matmul_ext = matmul_primitive_create_and_cache(
-      jd, tt, b_type, m, n, k, lda, ldb, ldc, dev_id, f_attr, sc_group_size);
+      jd, tt, b_type, m, n, k, lda, ldb, ldc, dev_id, f_attr, attr_key);
 
   matmul_ext.set_attribute(
       arg_off++,

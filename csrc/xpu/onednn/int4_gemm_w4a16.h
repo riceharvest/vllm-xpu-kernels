@@ -88,7 +88,18 @@ static inline void dnnl_matmul_w4a16_int4(
   const int dev_id = c10::xpu::getCurrentXPUStream().device_index();
   at::Device curDevice = at::Device(at::kXPU, dev_id);
   auto engine = GpuEngineManager::Instance().get_engine(curDevice);
-  int64_t zp_group_size = zp.dim() == 1 ? 1 : group_size;
+  // Cache key: one field per value. The scale dtype, the zero-point mode
+  // (s8 symmetric with get_onednn_md(zp) vs u4 grouped {k/group_size, n})
+  // and the scale / zp tensor layouts are baked into the cached primitive
+  // and its scale / zp memory descriptors.
+  const bool zp_symmetric = zp.dim() == 1;
+  memory::dims attr_key;
+  append_key(attr_key, result.scalar_type());
+  append_key(attr_key, in_dtype);
+  append_key(attr_key, group_size);
+  append_key(attr_key, static_cast<int64_t>(zp_symmetric));
+  append_tensor_key(attr_key, scale);
+  append_tensor_key(attr_key, zp);
   auto& matmul_ext = matmul_primitive_create_and_cache(
       jd,
       trans_type_t::nt,
@@ -101,8 +112,7 @@ static inline void dnnl_matmul_w4a16_int4(
       ldc,
       dev_id,
       f_attr,
-      group_size,
-      zp_group_size);
+      attr_key);
 
   int arg_off = 0;
   // set scale and zero point for matmul args

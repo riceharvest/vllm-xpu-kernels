@@ -127,11 +127,16 @@ static inline void dnnl_matmul_w4a4_fp4(
   at::Device curDevice = at::Device(at::kXPU, dev_id);
   auto engine = GpuEngineManager::Instance().get_engine(curDevice);
 
-  int m1_sc_group_size = m1_sc.numel();
-  int m2_sc_group_size = m2_sc.numel();
-  int sc_group_size = (m1_sc_group_size << 8) | m2_sc_group_size;
+  // Cache key: one field per value (the old (m1.numel() << 8) | m2.numel()
+  // packing had overlapping bits). Scale dtype / shape / strides select the
+  // set_scales() branch and the cached scale memory descriptors.
+  memory::dims attr_key;
+  append_key(attr_key, result.scalar_type());
+  append_key(attr_key, mat2.scalar_type());
+  append_tensor_key(attr_key, m1_sc);
+  append_tensor_key(attr_key, m2_sc);
   auto& matmul_ext = matmul_primitive_create_and_cache(
-      jd, tt, b_type, m, n, k, lda, ldb, ldc, dev_id, f_attr, sc_group_size);
+      jd, tt, b_type, m, n, k, lda, ldb, ldc, dev_id, f_attr, attr_key);
 
   matmul_ext.set_attribute(
       arg_off++,

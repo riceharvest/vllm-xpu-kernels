@@ -776,6 +776,34 @@ T1 concat(const T1& t1, const T2& t2, const Ts&... ts) {
   return concat(concat(t1, t2), ts...);
 }
 
+// Primitive cache key helpers. A key field must never pack several values
+// into one integer (OR / XOR / multiply): two different attribute sets can
+// then map to the same key and silently reuse a primitive (and the scale /
+// zero-point memory descriptors cached in primitive_ext) built for the other.
+static inline void append_key(memory::dims& key, int64_t v) {
+  key.push_back(v);
+}
+
+static inline void append_key(memory::dims& key, at::ScalarType t) {
+  key.push_back(static_cast<int64_t>(t));
+}
+
+// Appends dtype, rank, sizes and strides of a tensor whose memory descriptor
+// is built by get_onednn_md() and cached on the first call. The rank prefix
+// keeps consecutive variable-rank tensors unambiguous.
+static inline void append_tensor_key(memory::dims& key, const at::Tensor& t) {
+  if (!t.defined()) {
+    key.push_back(-1);
+    return;
+  }
+  key.push_back(static_cast<int64_t>(t.scalar_type()));
+  key.push_back(t.dim());
+  for (const auto s : t.sizes())
+    key.push_back(s);
+  for (const auto s : t.strides())
+    key.push_back(s);
+}
+
 using primitive_cache = lru_cache<memory::dims, primitive_ext>;
 
 template <trans_type_t Tt, joint_dtypes_t Ts, typename F>
@@ -791,22 +819,29 @@ struct matmul_primitive_cache_t {
           b_type,  // for shapeless bias, not put it into template parameter
       const int device_id,
       F f_attr,
-      const int scale_group_size,
-      const int zp_group_size,
+      const memory::dims& attr_key,
       const int batch_dim) {
     auto& cached = get_cache(device_id);
     memory::dims src_strides, wei_strides, dst_strides;
     get_strides<Tt>(src_strides, wei_strides, dst_strides, lda, ldb, ldc);
-    auto pri_key = concat(
-        src_strides,
-        wei_strides,
-        m,
-        n,
-        k,
-        batch_dim,
-        int(b_type),
-        scale_group_size,
-        zp_group_size);
+    // Every field is stored separately (int64). The fixed-size part is
+    // followed by the call site's attribute key (see append_tensor_key):
+    // scale / zero-point dtypes, shapes, strides, masks, group sizes and the
+    // output dtype. The cache is per (Tt, Ts, F), i.e. per call site.
+    memory::dims pri_key;
+    pri_key.reserve(
+        src_strides.size() + wei_strides.size() + dst_strides.size() + 6 +
+        attr_key.size());
+    pri_key.insert(pri_key.end(), src_strides.begin(), src_strides.end());
+    pri_key.insert(pri_key.end(), wei_strides.begin(), wei_strides.end());
+    pri_key.insert(pri_key.end(), dst_strides.begin(), dst_strides.end());
+    pri_key.push_back(m);
+    pri_key.push_back(n);
+    pri_key.push_back(k);
+    pri_key.push_back(batch_dim);
+    pri_key.push_back(static_cast<int64_t>(b_type));
+    pri_key.push_back(static_cast<int64_t>(attr_key.size()));
+    pri_key.insert(pri_key.end(), attr_key.begin(), attr_key.end());
     auto iter = cached.find(pri_key);
     if (iter == cached.end()) {
       auto [src_dt, wei_dt, dst_dt] = onednn_types_mapper<Ts>::get();
@@ -904,38 +939,15 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
     const int64_t ldc,
     const int device_id,
     F attr,
-    const int scale_group_size,
-    const int zp_group_size,
+    const memory::dims& attr_key,
     const int batch_dim = -1) {
   switch (Tt) {
     case trans_type_t::nt:
       return matmul_primitive_cache_t<trans_type_t::nt, Ts, F>::get(
-          m,
-          n,
-          k,
-          lda,
-          ldb,
-          ldc,
-          b_type,
-          device_id,
-          attr,
-          scale_group_size,
-          zp_group_size,
-          batch_dim);
+          m, n, k, lda, ldb, ldc, b_type, device_id, attr, attr_key, batch_dim);
     case trans_type_t::nn:
       return matmul_primitive_cache_t<trans_type_t::nn, Ts, F>::get(
-          m,
-          n,
-          k,
-          lda,
-          ldb,
-          ldc,
-          b_type,
-          device_id,
-          attr,
-          scale_group_size,
-          zp_group_size,
-          batch_dim);
+          m, n, k, lda, ldb, ldc, b_type, device_id, attr, attr_key, batch_dim);
     default:
       throw std::runtime_error("unsupported trans type ...");
   }
@@ -954,8 +966,7 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
     const int64_t ldc,
     const int device_id,
     F attr,
-    const int scale_group_size = 1,
-    const int zp_group_size = 1,
+    const memory::dims& attr_key,
     const int batch_dim = -1) {
   switch (Ts) {
     case joint_dtypes_t::f16_int4:
@@ -970,8 +981,7 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
           ldc,
           device_id,
           attr,
-          scale_group_size,
-          zp_group_size,
+          attr_key,
           batch_dim);
     case joint_dtypes_t::bf16_int4:
       return matmul_primitive_create_and_cache<joint_dtypes_t::bf16_int4, F>(
@@ -985,8 +995,7 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
           ldc,
           device_id,
           attr,
-          scale_group_size,
-          zp_group_size,
+          attr_key,
           batch_dim);
     case joint_dtypes_t::s8_int4:
       return matmul_primitive_create_and_cache<joint_dtypes_t::s8_int4, F>(
@@ -1000,8 +1009,7 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
           ldc,
           device_id,
           attr,
-          scale_group_size,
-          zp_group_size,
+          attr_key,
           batch_dim);
     case joint_dtypes_t::u8_int4:
       return matmul_primitive_create_and_cache<joint_dtypes_t::u8_int4, F>(
@@ -1015,8 +1023,7 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
           ldc,
           device_id,
           attr,
-          scale_group_size,
-          zp_group_size,
+          attr_key,
           batch_dim);
     case joint_dtypes_t::f16_f8_e5m2:
       return matmul_primitive_create_and_cache<joint_dtypes_t::f16_f8_e5m2, F>(
@@ -1030,8 +1037,7 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
           ldc,
           device_id,
           attr,
-          scale_group_size,
-          zp_group_size,
+          attr_key,
           batch_dim);
     case joint_dtypes_t::bf16_f8_e5m2:
       return matmul_primitive_create_and_cache<joint_dtypes_t::bf16_f8_e5m2, F>(
@@ -1045,8 +1051,7 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
           ldc,
           device_id,
           attr,
-          scale_group_size,
-          zp_group_size,
+          attr_key,
           batch_dim);
     case joint_dtypes_t::f16_f8_e4m3:
       return matmul_primitive_create_and_cache<joint_dtypes_t::f16_f8_e4m3, F>(
@@ -1060,8 +1065,7 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
           ldc,
           device_id,
           attr,
-          scale_group_size,
-          zp_group_size,
+          attr_key,
           batch_dim);
     case joint_dtypes_t::bf16_f8_e4m3:
       return matmul_primitive_create_and_cache<joint_dtypes_t::bf16_f8_e4m3, F>(
@@ -1075,8 +1079,7 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
           ldc,
           device_id,
           attr,
-          scale_group_size,
-          zp_group_size,
+          attr_key,
           batch_dim);
     case joint_dtypes_t::f8_e5m2_f16:
       return matmul_primitive_create_and_cache<joint_dtypes_t::f8_e5m2_f16, F>(
@@ -1090,8 +1093,7 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
           ldc,
           device_id,
           attr,
-          scale_group_size,
-          zp_group_size,
+          attr_key,
           batch_dim);
     case joint_dtypes_t::f8_e5m2_bf16:
       return matmul_primitive_create_and_cache<joint_dtypes_t::f8_e5m2_bf16, F>(
@@ -1105,8 +1107,7 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
           ldc,
           device_id,
           attr,
-          scale_group_size,
-          zp_group_size,
+          attr_key,
           batch_dim);
     case joint_dtypes_t::f8_e4m3_f16:
       return matmul_primitive_create_and_cache<joint_dtypes_t::f8_e4m3_f16, F>(
@@ -1120,8 +1121,7 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
           ldc,
           device_id,
           attr,
-          scale_group_size,
-          zp_group_size,
+          attr_key,
           batch_dim);
     case joint_dtypes_t::f8_e4m3_bf16:
       return matmul_primitive_create_and_cache<joint_dtypes_t::f8_e4m3_bf16, F>(
@@ -1135,8 +1135,7 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
           ldc,
           device_id,
           attr,
-          scale_group_size,
-          zp_group_size,
+          attr_key,
           batch_dim);
     case joint_dtypes_t::mxfp4_bf16:
       return matmul_primitive_create_and_cache<joint_dtypes_t::mxfp4_bf16, F>(
@@ -1150,8 +1149,7 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
           ldc,
           device_id,
           attr,
-          scale_group_size,
-          zp_group_size,
+          attr_key,
           batch_dim);
     case joint_dtypes_t::mxfp4_f16:
       return matmul_primitive_create_and_cache<joint_dtypes_t::mxfp4_f16, F>(
@@ -1165,8 +1163,7 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
           ldc,
           device_id,
           attr,
-          scale_group_size,
-          zp_group_size,
+          attr_key,
           batch_dim);
     default:
       throw std::runtime_error("Only support int4 and fp8 gemm ...");

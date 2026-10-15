@@ -162,14 +162,28 @@ static inline void dnnl_matmul_w8a8_fp8(
   at::Device curDevice = at::Device(at::kXPU, dev_id);
   auto engine = GpuEngineManager::Instance().get_engine(curDevice);
 
-  int m1_sc_group_size = m1_sc.numel();
-  int m2_sc_group_size = m2_sc.numel();
-  int sc_group_size = (m1_sc_group_size << 8) | m2_sc_group_size;
-  if (m1_sc.scalar_type() == at::ScalarType::Float8_e8m0fnu) {
-    sc_group_size |= (1 << 30);
-  }
+  // Cache key: everything f_attr and the cached scale memories depend on,
+  // one field per value. The old (m1.numel() << 8) | m2.numel() packing had
+  // overlapping bits (M=17 per-token + N=4096 per-channel == per-tensor +
+  // N=4352) and left out the scale dtypes.
+  const int src_sc_mask = is_block_quant       ? (1 << 0) + (1 << 1)
+                          : m1_sc.numel() == 1 ? 0
+                                               : (1 << 0) + (1 << 1);
+  const int wei_sc_mask = is_block_quant       ? (1 << 0) + (1 << 1)
+                          : m2_sc.numel() == 1 ? 0
+                                               : (1 << 1);
+  memory::dims attr_key;
+  append_key(attr_key, result.scalar_type());
+  append_key(attr_key, mat2.scalar_type());
+  append_key(attr_key, static_cast<int64_t>(is_block_quant));
+  append_key(attr_key, src_sc_mask);
+  append_key(attr_key, wei_sc_mask);
+  append_key(attr_key, wei_group_k);
+  append_key(attr_key, wei_group_n);
+  append_tensor_key(attr_key, m1_sc);
+  append_tensor_key(attr_key, m2_sc);
   auto& matmul_ext = matmul_primitive_create_and_cache(
-      jd, tt, b_type, m, n, k, lda, ldb, ldc, dev_id, f_attr, sc_group_size);
+      jd, tt, b_type, m, n, k, lda, ldb, ldc, dev_id, f_attr, attr_key);
 
   matmul_ext.set_attribute(
       arg_off++,
@@ -387,18 +401,21 @@ static inline void dnnl_batch_matmul_w8a8_fp8(
   at::Device curDevice = at::Device(at::kXPU, dev_id);
   auto engine = GpuEngineManager::Instance().get_engine(curDevice);
 
-  auto hash_dims = [](const torch::Tensor& tensor) {
-    int hash = tensor.dim();
-    for (const auto size : tensor.sizes()) {
-      hash = hash * 131 + static_cast<int>(size);
-    }
-    return hash;
-  };
-
-  int sc_group_size = (hash_dims(src_sc) << 8) ^ hash_dims(wei_sc);
-  if (src_sc.scalar_type() == at::ScalarType::Float8_e8m0fnu) {
-    sc_group_size |= (1 << 30);
-  }
+  // Cache key: one field per value (no hashing / XOR). wei_sc is keyed
+  // after the [N] -> [1, N] reshape because that tensor builds the cached
+  // scale memory descriptor.
+  memory::dims attr_key;
+  append_key(attr_key, result.scalar_type());
+  append_key(attr_key, mat2.scalar_type());
+  append_key(attr_key, static_cast<int64_t>(src_scalar));
+  append_key(attr_key, static_cast<int64_t>(src_block_quant));
+  append_key(attr_key, src_group_k);
+  append_key(attr_key, static_cast<int64_t>(wei_scalar));
+  append_key(attr_key, static_cast<int64_t>(wei_block_quant));
+  append_key(attr_key, wei_group_k);
+  append_key(attr_key, wei_group_n);
+  append_tensor_key(attr_key, src_sc);
+  append_tensor_key(attr_key, wei_sc);
 
   auto mat1_strides = mat1.strides();
   int64_t leading_dim = mat1_strides[0] < mat1_strides[1] ? 0 : 1;
@@ -420,8 +437,7 @@ static inline void dnnl_batch_matmul_w8a8_fp8(
       ldc,
       dev_id,
       f_attr,
-      sc_group_size,
-      1,
+      attr_key,
       static_cast<int>(batch));
   int arg_off = 0;
   matmul_ext.set_attribute(
