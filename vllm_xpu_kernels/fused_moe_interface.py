@@ -244,6 +244,14 @@ class XpuFusedMoe:
         else:
             self.gemm1_wei_scales = w13_scales
             self.gemm2_wei_scales = w2_scales
+        # The native Xe2 MXFP8 grouped GEMM consumes scales as [E, N, K/32] and
+        # transposes [E, K/32, N] input on every call (all experts, both GEMMs,
+        # every layer). Do that layout change once here instead.
+        if (is_mxfp8 and not _should_use_ref_fused_moe(is_mxfp8, is_block_fp8)
+                and w13_scales is not None and w13_scales.dim() == 3
+                and w2_scales is not None and w2_scales.dim() == 3):
+            self.gemm1_wei_scales = w13_scales.transpose(1, 2).contiguous()
+            self.gemm2_wei_scales = w2_scales.transpose(1, 2).contiguous()
 
         self.w13_bias = w13_bias
         self.w2_bias = w2_bias
