@@ -745,7 +745,13 @@ void call_rms_norm_per_block_quant_kernel(
   const int64_t input_stride = input.stride(0);
   const int64_t num_tokens = input.numel() / hidden_size;
   const int num_groups = hidden_size / group_size;
-  const int block_size = std::min(hidden_size, 1024);
+  // The kernel's unit of work is one 16-byte vector (VEC elements), so size
+  // the work-group by vectors, not elements: round up to the sub-group size
+  // (32) so quant groups stay sub-group aligned, cap at 1024.
+  constexpr int VEC = 16 / sizeof(sycl_t);
+  const int num_vec = hidden_size / VEC;
+  const int block_size =
+      std::min(std::max(((num_vec + 31) / 32) * 32, 32), 1024);
 
   // Compute scale strides based on transposition
   const int64_t scale_stride_token =
