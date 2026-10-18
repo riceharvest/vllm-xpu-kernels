@@ -755,3 +755,10 @@ def _fallback_varlen_attn(
     if return_softmax_lse:
         return result[0], result[1]
     return result, None
+
+# B70_SPEC_PACKED
+import os as _b70os
+if _b70os.environ.get('B70_SPEC_PACKED') == '1':
+    import sys as _b70sys
+    _b70sys.path.insert(0, '/opt/b70')
+    import spec_packed  # noqa: F401
