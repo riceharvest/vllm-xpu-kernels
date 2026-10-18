@@ -183,6 +183,45 @@ def implement_zp(qweight):
 
     return result
 
+# B70_MOE_GEMV
+import os as _b70os
+_B70_GEMV = _b70os.environ.get("B70_MOE_GEMV") == "1"
+_B70_MAXROWS = int(_b70os.environ.get("B70_MOE_GEMV_MAXROWS", "8"))
+if _B70_GEMV:
+    torch.ops.load_library(_b70os.environ.get("B70_MOE_GEMV_SO", "/opt/b70moe/b70_moe_gemv.so"))
+    try:
+        @torch.library.register_fake("b70_moe::gemv")
+        def _b70_gemv_fake(A, B, S, rows, D, N, K, E, G, nr, low_first):
+            return None
+    except Exception:
+        pass
+
+
+def _b70_grouped_gemm(is_int4, **kw):
+    A, B, S, D = kw["ptr_A"], kw["ptr_B"], kw.get("ptr_B_scale"), kw["ptr_D"]
+    K, N, E = kw["K"], kw["N"], kw["num_experts"]
+    if (_B70_GEMV and is_int4 and kw.get("ptr_A_scale") is None and kw.get("ptr_bias") is None and S is not None
+            and S.dim() == 3 and A.dtype in (torch.float16, torch.bfloat16) and S.dtype == A.dtype
+            and A.shape[0] <= _B70_MAXROWS and K % 512 == 0
+            and (_b70os.environ.get("B70_MOE_GEMV_ONLY_N") in (None, "", str(N))) and K % S.shape[-1] == 0 and (K // S.shape[-1]) % 32 == 0
+            and A.is_contiguous() and B.is_contiguous() and S.is_contiguous() and D.is_contiguous()):
+        torch.ops.b70_moe.gemv(A, B, S, kw["rows_per_expert"], D, N, K, E, K // S.shape[-1], 4, True)
+        if _b70os.environ.get("B70_MOE_GEMV_CHECK") == "1":   # debug: compare with CUTLASS, dump on mismatch (eager only)
+            ref = torch.empty_like(D); kw2 = dict(kw); kw2["ptr_D"] = ref
+            torch.ops._xpu_C.cutlass_grouped_gemm_interface(**kw2)
+            rel = ((D.float() - ref.float()).norm(dim=1) / ref.float().norm(dim=1).clamp(min=1e-6))
+            global _B70_NCHK
+            _B70_NCHK = globals().get("_B70_NCHK", 0) + 1
+            if bool(torch.isnan(D).any()) or float(rel.max()) > 1e-2:
+                rows = kw["rows_per_expert"]; ex = torch.nonzero(rows).flatten()
+                fn = _b70os.path.join(_b70os.environ.get("B70_MOE_GEMV_CHECK_DIR", "/tmp"), f"b70_gemv_mismatch_{_B70_NCHK}.pt")
+                torch.save({"A": A.cpu(), "rows": rows.cpu(), "experts": ex.cpu(), "B": B[ex].cpu(), "S": S[ex].cpu(), "D": D.cpu(), "ref": ref.cpu(),
+                            "N": N, "K": K, "E": E, "rel": rel.cpu()}, fn)
+                print(f"[B70] GEMV MISMATCH call {_B70_NCHK} N={N} K={K} max_row_rel={float(rel.max()):.3g} nan={bool(torch.isnan(D).any())} -> {fn}", flush=True)
+        return
+    torch.ops._xpu_C.cutlass_grouped_gemm_interface(**kw)
+
+
 class XpuFusedMoe:
     def __init__(
         self,
@@ -421,7 +460,7 @@ class XpuFusedMoe:
         gemm1_output = torch.empty((num_moe_inputs, 2 * self.inter_size),
                                 dtype=output.dtype,
                                 device=output.device)
-        torch.ops._xpu_C.cutlass_grouped_gemm_interface(
+        _b70_grouped_gemm(self.is_int4,
             ptr_A=remapped_hidden_states,
             ptr_A_scale=remapped_scales,
             ptr_B=self.w13,
@@ -475,7 +514,7 @@ class XpuFusedMoe:
                 gemm2_act_scale = None
         else:
             gemm2_act_scale = None
-        torch.ops._xpu_C.cutlass_grouped_gemm_interface(
+        _b70_grouped_gemm(self.is_int4,
             ptr_A=act_output,
             ptr_A_scale=gemm2_act_scale,
             ptr_B=self.w2,
